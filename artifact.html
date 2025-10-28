@@ -1,0 +1,533 @@
+﻿<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Welcome file</title>
+  <link rel="stylesheet" href="https://stackedit.io/style.css" />
+</head>
+
+<body class="stackedit">
+  <div class="stackedit__html"><h1 id="table-of-contents">Table of Contents</h1>
+<p>This is a modified version of the artifact for the paper “Mutiny! How does Kubernetes fail, and what can we do about it?” DSN,2024. This version has been modified to adapt Mutiny for serverless (FaaS) workloads.</p>
+<ol>
+<li><a href="#artifact-structure">Artifact content</a></li>
+<li><a href="#injector-architecture">Injector architecture</a></li>
+<li><a href="#dataset-organization">Dataset organization</a></li>
+<li><a href="#run-experiments">Run etcd injections</a>
+<ol>
+<li><a href="#setup-environment">Setup environment</a></li>
+<li><a href="#record-phase">Record phase</a></li>
+<li><a href="#injection-campaign">Injection campaign</a></li>
+</ol>
+</li>
+<li><a href="#data-analysis">Data analysis</a>
+<ol>
+<li><a href="#data-organization">Data organization</a></li>
+<li><a href="#analyze-injection-data">Analyze injection data</a></li>
+</ol>
+</li>
+<li><a href="#propagation">Propagation experiment</a>
+<ol>
+<li><a href="#run-experiments">Run experiments</a></li>
+<li><a href="#analyze-data">Analyze data</a></li>
+</ol>
+</li>
+</ol>
+<h1 id="artifact-structure">Artifact structure</h1>
+<p>On zenodo, we uploaded:</p>
+<ul>
+<li>dataset.tar.gz containing the dataset</li>
+<li>building_machine.tar.gz, containing the files to use in the building machine (i.e., your laptop)<br>
+*controlplaneVM.tar.gz containing the files to use in the control plane VM (and that are already contained in the given VM)</li>
+<li>The VM .ova file</li>
+<li>This readme, to follow with instructions</li>
+<li>The license file of the artifact</li>
+</ul>
+<p>We will assume in the following that the files of the building machine zip are extracted having such folder tree:</p>
+<ul>
+<li>dataset containing the dataset extracted</li>
+<li>mutiny containing the cloned repo to build K8s (see following sections)</li>
+<li>record containing the files to perform the recording phase (see following sections)</li>
+<li>analysis containing the analysis to analyze scripts</li>
+<li>The injector code used in K8s (only to make this artifact self contained)<br>
+In the same way, we will assume in the following that in the control plane VM there is such direcotry tree:</li>
+<li>/root/images containing the vanilla images of the components</li>
+<li>/root/quis  containing the scripts and other files for the experiments</li>
+<li>/root/kube- *.tar.gz that are the images of the components already built and used in teh experiments</li>
+</ul>
+<p>Up to date versions for the Kubernetes repo with the injector and the scripts are at:<br>
+
+	<code>git clone https://dessert.unina.it:8088/marcobarlo/mutiny</code><br>
+	<code>git clone https://dessert.unina.it:8088/marcobarlo/mutiny-scripts</code></p>
+
+<p>If the cloned repository has no tag, we recommend adding one because it will be used during the image-building phase.<br> 
+<p> You can use the following command: <code>git tag 1.27.10</code><br>
+
+<h1 id="injector-architecture">Injector architecture</h1>
+<p>Mutiny is the injector for Kubernetes that allows to modify the content of messages exchanged between Kubernetes component. It is described in section IV of the paper.<br>
+The injector is composed of three files: the main file starting the HTTP server on the port 8988 (if available), the endpoint.go files that contains functions to map data received over HTTP to data needed by the injector, and finally the file containing the injection logic.<br>
+The injector exposes an HTTP server through which the user can configure it. First the user needs to configure for the injector the API version, API group, probability of injection, and message content. Once the injector is reconfigured, injection triggers can be installed through the HTTP server. Those specify: the value of the injection, the field to inject, the object kind to inject, the order index of the message, a flag to specify whether to inject the protobuf protocol, and a field to specify which part of protobuf protocol.  Those values are all contained in an HTTP body.</p>
+<p>To call the injector, some files need to be instrumented:</p>
+<ul>
+<li>
+<p><code>staging/src/k8s.io/apiserver/pkg/storage/etcd3/store.go</code>, which contains the functions to communicate from the apiserver with etcd. The functions injected are Create and GuaranteedUpdate.</p>
+</li>
+<li>
+<p><code>staging/src/k8s.io/client-go/rest/request.go</code>, which contains functions to perform HTTP requests. This file is used and compiled in all the components of K8s. The function injected is Do, which performs the HTTP request.<br>
+In both case, code to call the injector is inserted right after the encoding to protobuf of the object to send.<br>
+The code to instrument the files looks like this (example code for request.go file):</p>
+<pre><code>  injectorp  := injector.GetInjector()
+  if injectorp !=  nil {
+  	packet_injected, err  := injectorp.ApplyInjections(r.bodyBytes)
+  	if err !=  nil {
+  		klog.Infof(err.Error())
+  		return result
+  	}
+  	r.bodyBytes  = packet_injected
+  }
+</code></pre>
+</li>
+</ul>
+<p>In which the parameter passed to ApplyInjections is an array of bytes.<br>
+However this instrumentation does nothing if the injector is not started. (injectorp is null)<br>
+To start the injector call <code>go injector.StartInjector()</code> in the code of a component that you want to patch to use the injector.<br>
+For example, in the following the file containing the main for the apiserver:</p>
+<pre><code>	import (
+		"os"
+		_ "time/tzdata" // for timeZone support in CronJob
+		"k8s.io/component-base/cli"
+		_ "k8s.io/component-base/logs/json/register"      
+		_ "k8s.io/component-base/metrics/prometheus/clientgo"
+		_ "k8s.io/component-base/metrics/prometheus/version"  
+		"k8s.io/kubernetes/cmd/kube-apiserver/app"
+		injector "k8s.io/client-go/rest/injector"
+	)
+
+	func main() {
+		go injector.StartInjector()
+		command := app.NewAPIServerCommand()
+		code := cli.Run(command)
+		os.Exit(code)
+	}
+</code></pre>
+<p>In our repo, in cmd/ there are all the files .go of the main routine of each component (e.g., cmd/kube-apiserver/apiserver.go). In each of the main routines we inserted this line (and related necessary import).<br>
+StartInjector() creates the singleton of injector and starts the HTTP server to listen for configuration packets. If more than one component that start the injector are running at the same time, the injector of each component scans for ports after 8988 to find a free port were to listen. In this case each component would have an injector listening to a different port waiting to be configured.</p>
+<p>In the following, an example diagram of the flow with the Apiserver instrumented to inject with Mutiny.</p>
+<pre class=" language-mermaid"><svg id="mermaid-svg-wLP3Y2zeLAdJXbRh" width="100%" xmlns="http://www.w3.org/2000/svg" height="581" style="max-width: 1377.5px;" viewBox="-50 -10 1377.5 581"><style>#mermaid-svg-wLP3Y2zeLAdJXbRh{font-family:"trebuchet ms",verdana,arial,sans-serif;font-size:16px;fill:#000000;}#mermaid-svg-wLP3Y2zeLAdJXbRh .error-icon{fill:#552222;}#mermaid-svg-wLP3Y2zeLAdJXbRh .error-text{fill:#552222;stroke:#552222;}#mermaid-svg-wLP3Y2zeLAdJXbRh .edge-thickness-normal{stroke-width:2px;}#mermaid-svg-wLP3Y2zeLAdJXbRh .edge-thickness-thick{stroke-width:3.5px;}#mermaid-svg-wLP3Y2zeLAdJXbRh .edge-pattern-solid{stroke-dasharray:0;}#mermaid-svg-wLP3Y2zeLAdJXbRh .edge-pattern-dashed{stroke-dasharray:3;}#mermaid-svg-wLP3Y2zeLAdJXbRh .edge-pattern-dotted{stroke-dasharray:2;}#mermaid-svg-wLP3Y2zeLAdJXbRh .marker{fill:#666;stroke:#666;}#mermaid-svg-wLP3Y2zeLAdJXbRh .marker.cross{stroke:#666;}#mermaid-svg-wLP3Y2zeLAdJXbRh svg{font-family:"trebuchet ms",verdana,arial,sans-serif;font-size:16px;}#mermaid-svg-wLP3Y2zeLAdJXbRh .actor{stroke:hsl(0,0%,83%);fill:#eee;}#mermaid-svg-wLP3Y2zeLAdJXbRh text.actor > tspan{fill:#333;stroke:none;}#mermaid-svg-wLP3Y2zeLAdJXbRh .actor-line{stroke:#666;}#mermaid-svg-wLP3Y2zeLAdJXbRh .messageLine0{stroke-width:1.5;stroke-dasharray:none;stroke:#333;}#mermaid-svg-wLP3Y2zeLAdJXbRh .messageLine1{stroke-width:1.5;stroke-dasharray:2,2;stroke:#333;}#mermaid-svg-wLP3Y2zeLAdJXbRh #arrowhead path{fill:#333;stroke:#333;}#mermaid-svg-wLP3Y2zeLAdJXbRh .sequenceNumber{fill:white;}#mermaid-svg-wLP3Y2zeLAdJXbRh #sequencenumber{fill:#333;}#mermaid-svg-wLP3Y2zeLAdJXbRh #crosshead path{fill:#333;stroke:#333;}#mermaid-svg-wLP3Y2zeLAdJXbRh .messageText{fill:#333;stroke:#333;}#mermaid-svg-wLP3Y2zeLAdJXbRh .labelBox{stroke:hsl(0,0%,83%);fill:#eee;}#mermaid-svg-wLP3Y2zeLAdJXbRh .labelText,#mermaid-svg-wLP3Y2zeLAdJXbRh .labelText > tspan{fill:#333;stroke:none;}#mermaid-svg-wLP3Y2zeLAdJXbRh .loopText,#mermaid-svg-wLP3Y2zeLAdJXbRh .loopText > tspan{fill:#333;stroke:none;}#mermaid-svg-wLP3Y2zeLAdJXbRh .loopLine{stroke-width:2px;stroke-dasharray:2,2;stroke:hsl(0,0%,83%);fill:hsl(0,0%,83%);}#mermaid-svg-wLP3Y2zeLAdJXbRh .note{stroke:hsl(60,100%,23.3333333333%);fill:#ffa;}#mermaid-svg-wLP3Y2zeLAdJXbRh .noteText,#mermaid-svg-wLP3Y2zeLAdJXbRh .noteText > tspan{fill:#333;stroke:none;}#mermaid-svg-wLP3Y2zeLAdJXbRh .activation0{fill:#f4f4f4;stroke:#666;}#mermaid-svg-wLP3Y2zeLAdJXbRh .activation1{fill:#f4f4f4;stroke:#666;}#mermaid-svg-wLP3Y2zeLAdJXbRh .activation2{fill:#f4f4f4;stroke:#666;}#mermaid-svg-wLP3Y2zeLAdJXbRh:root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}#mermaid-svg-wLP3Y2zeLAdJXbRh sequence{fill:apa;}</style><g></g><g><line id="actor30" x1="75" y1="5" x2="75" y2="570" class="actor-line" stroke-width="0.5px" stroke="#999"></line><rect x="0" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" rx="3" ry="3" class="actor"></rect><text x="75" y="32.5" style="text-anchor: middle; font-weight: 400; font-family: &quot;Open-Sans&quot;, &quot;sans-serif&quot;;" dominant-baseline="central" alignment-baseline="central" class="actor"><tspan x="75" dy="0">User</tspan></text></g><g><line id="actor31" x1="530" y1="5" x2="530" y2="570" class="actor-line" stroke-width="0.5px" stroke="#999"></line><rect x="455" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" rx="3" ry="3" class="actor"></rect><text x="530" y="32.5" style="text-anchor: middle; font-weight: 400; font-family: &quot;Open-Sans&quot;, &quot;sans-serif&quot;;" dominant-baseline="central" alignment-baseline="central" class="actor"><tspan x="530" dy="0">Mutiny</tspan></text></g><g><line id="actor32" x1="733.5" y1="5" x2="733.5" y2="570" class="actor-line" stroke-width="0.5px" stroke="#999"></line><rect x="655" y="0" fill="#eaeaea" stroke="#666" width="157" height="65" rx="3" ry="3" class="actor"></rect><text x="733.5" y="32.5" style="text-anchor: middle; font-weight: 400; font-family: &quot;Open-Sans&quot;, &quot;sans-serif&quot;;" dominant-baseline="central" alignment-baseline="central" class="actor"><tspan x="733.5" dy="0">Other Compoennt</tspan></text></g><g><line id="actor33" x1="1002.5" y1="5" x2="1002.5" y2="570" class="actor-line" stroke-width="0.5px" stroke="#999"></line><rect x="927.5" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" rx="3" ry="3" class="actor"></rect><text x="1002.5" y="32.5" style="text-anchor: middle; font-weight: 400; font-family: &quot;Open-Sans&quot;, &quot;sans-serif&quot;;" dominant-baseline="central" alignment-baseline="central" class="actor"><tspan x="1002.5" dy="0">Apiserver</tspan></text></g><g><line id="actor34" x1="1202.5" y1="5" x2="1202.5" y2="570" class="actor-line" stroke-width="0.5px" stroke="#999"></line><rect x="1127.5" y="0" fill="#eaeaea" stroke="#666" width="150" height="65" rx="3" ry="3" class="actor"></rect><text x="1202.5" y="32.5" style="text-anchor: middle; font-weight: 400; font-family: &quot;Open-Sans&quot;, &quot;sans-serif&quot;;" dominant-baseline="central" alignment-baseline="central" class="actor"><tspan x="1202.5" dy="0">Etcd</tspan></text></g><defs><marker id="arrowhead" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z"></path></marker></defs><defs><marker id="crosshead" markerWidth="15" markerHeight="8" orient="auto" refX="16" refY="4"><path fill="black" stroke="#000000" style="stroke-dasharray: 0px, 0px;" stroke-width="1px" d="M 9,2 V 6 L16,4 Z"></path><path fill="none" stroke="#000000" style="stroke-dasharray: 0px, 0px;" stroke-width="1px" d="M 0,1 L 6,7 M 6,1 L 0,7"></path></marker></defs><defs><marker id="filled-head" refX="18" refY="7" markerWidth="20" markerHeight="28" orient="auto"><path d="M 18,7 L9,13 L14,7 L9,1 Z"></path></marker></defs><defs><marker id="sequencenumber" refX="15" refY="15" markerWidth="60" markerHeight="40" orient="auto"><circle cx="15" cy="15" r="6"></circle></marker></defs><text x="303" y="80" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" style="font-family: &quot;trebuchet ms&quot;, verdana, arial, sans-serif; font-weight: 400;" class="messageText" dy="1em">Configure: API version, group, probability, protobuf</text><line x1="75" y1="119" x2="530" y2="119" class="messageLine0" stroke-width="2" stroke="none" style="fill: none;" marker-end="url(#arrowhead)"></line><text x="303" y="134" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" style="font-family: &quot;trebuchet ms&quot;, verdana, arial, sans-serif; font-weight: 400;" class="messageText" dy="1em">Register: value, field, kind, order, proto, control</text><line x1="75" y1="173" x2="530" y2="173" class="messageLine0" stroke-width="2" stroke="none" style="fill: none;" marker-end="url(#arrowhead)"></line><text x="868" y="188" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" style="font-family: &quot;trebuchet ms&quot;, verdana, arial, sans-serif; font-weight: 400;" class="messageText" dy="1em">HTTP Reuqest (POST,PUT)</text><line x1="733.5" y1="221" x2="1002.5" y2="221" class="messageLine0" stroke-width="2" stroke="none" style="fill: none;" marker-end="url(#arrowhead)"></line><text x="766" y="236" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" style="font-family: &quot;trebuchet ms&quot;, verdana, arial, sans-serif; font-weight: 400;" class="messageText" dy="1em">Apply Injection</text><line x1="1002.5" y1="275" x2="530" y2="275" class="messageLine0" stroke-width="2" stroke="none" style="fill: none;" marker-end="url(#arrowhead)"></line><text x="766" y="290" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" style="font-family: &quot;trebuchet ms&quot;, verdana, arial, sans-serif; font-weight: 400;" class="messageText" dy="1em">Injected Message</text><line x1="530" y1="329" x2="1002.5" y2="329" class="messageLine0" stroke-width="2" stroke="none" style="fill: none;" marker-end="url(#arrowhead)"></line><text x="1103" y="344" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" style="font-family: &quot;trebuchet ms&quot;, verdana, arial, sans-serif; font-weight: 400;" class="messageText" dy="1em">Store/Update</text><line x1="1002.5" y1="383" x2="1202.5" y2="383" class="messageLine0" stroke-width="2" stroke="none" style="fill: none;" marker-end="url(#arrowhead)"></line><text x="1103" y="398" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" style="font-family: &quot;trebuchet ms&quot;, verdana, arial, sans-serif; font-weight: 400;" class="messageText" dy="1em">Done</text><line x1="1202.5" y1="437" x2="1002.5" y2="437" class="messageLine0" stroke-width="2" stroke="none" style="fill: none;" marker-end="url(#arrowhead)"></line><text x="868" y="452" text-anchor="middle" dominant-baseline="middle" alignment-baseline="middle" style="font-family: &quot;trebuchet ms&quot;, verdana, arial, sans-serif; font-weight: 400;" class="messageText" dy="1em">HTTP Response</text><line x1="1002.5" y1="485" x2="733.5" y2="485" class="messageLine0" stroke-width="2" stroke="none" style="fill: none;" marker-end="url(#arrowhead)"></line><g><rect x="0" y="505" fill="#eaeaea" stroke="#666" width="150" height="65" rx="3" ry="3" class="actor"></rect><text x="75" y="537.5" style="text-anchor: middle; font-weight: 400; font-family: &quot;Open-Sans&quot;, &quot;sans-serif&quot;;" dominant-baseline="central" alignment-baseline="central" class="actor"><tspan x="75" dy="0">User</tspan></text></g><g><rect x="455" y="505" fill="#eaeaea" stroke="#666" width="150" height="65" rx="3" ry="3" class="actor"></rect><text x="530" y="537.5" style="text-anchor: middle; font-weight: 400; font-family: &quot;Open-Sans&quot;, &quot;sans-serif&quot;;" dominant-baseline="central" alignment-baseline="central" class="actor"><tspan x="530" dy="0">Mutiny</tspan></text></g><g><rect x="655" y="505" fill="#eaeaea" stroke="#666" width="157" height="65" rx="3" ry="3" class="actor"></rect><text x="733.5" y="537.5" style="text-anchor: middle; font-weight: 400; font-family: &quot;Open-Sans&quot;, &quot;sans-serif&quot;;" dominant-baseline="central" alignment-baseline="central" class="actor"><tspan x="733.5" dy="0">Other Compoennt</tspan></text></g><g><rect x="927.5" y="505" fill="#eaeaea" stroke="#666" width="150" height="65" rx="3" ry="3" class="actor"></rect><text x="1002.5" y="537.5" style="text-anchor: middle; font-weight: 400; font-family: &quot;Open-Sans&quot;, &quot;sans-serif&quot;;" dominant-baseline="central" alignment-baseline="central" class="actor"><tspan x="1002.5" dy="0">Apiserver</tspan></text></g><g><rect x="1127.5" y="505" fill="#eaeaea" stroke="#666" width="150" height="65" rx="3" ry="3" class="actor"></rect><text x="1202.5" y="537.5" style="text-anchor: middle; font-weight: 400; font-family: &quot;Open-Sans&quot;, &quot;sans-serif&quot;;" dominant-baseline="central" alignment-baseline="central" class="actor"><tspan x="1202.5" dy="0">Etcd</tspan></text></g></svg></pre>
+<p>The injector acts in this way:</p>
+<ul>
+<li>If the injector enabled the packet is deserialized into a wrapper message that specifies the kind and keeps the rest of the content as raw bytes.</li>
+<li>If the kind matches a the kind of registered injection, the packet is deserialized into the object of that kind.</li>
+<li>The object is modified as instructed by the injector using reflections and accessing the object fields as a map.</li>
+<li>The modified object is re-serialized</li>
+<li>If the injection was successful (hence the field to inject was present), the counter of order is increased</li>
+<li>If the counter matches what specified in the injection configuration, the injected packet replaces the original packet and the injector is disabled</li>
+</ul>
+<p>The injector main code is contained in the Kubernetes source tree in our repo (<code>git clone https://dessert.unina.it:8088/marcobarlo/mutiny</code>) in the injectingapiserver branch (<code>git checkout injectingapiserver</code>) in the folder <code>staging/src/k8s.io/client-go/rest/injector/</code>.</p>
+<h1 id="dataset-organization">Dataset organization</h1>
+<p>The dataset is composed of different folders, divided by injections types.<br>
+In each folder there is a set of subfolder named like [progressive number of injection]_[workload] , e.g., 1_deploy ,1_scale, … , 400_deploy …<br>
+Each of these subfolder is an injection experiment.<br>
+In each folder, there is a file with latencies, a file with the tag of the injection, and all the logs collected.<br>
+The logs are divided by pod ( podID/podName/logname.log). The log of kbench is in kbench.log<br>
+In the log is written either the injection was applied or not (some injections were not applied because regarding fields unused in the experiment or high order indexes).<br>
+The folders of our dataset are:<br>
+999_99_99_apiserver_to_etc_ordered_127_allfields, 999_99_apiserver_to_etcd_ordered_allfields_datavaluesetrandom,<br>
+999_99_apiserver_etcd_drop_extended, 999_99_apiserver_etcd_drop, 999_99_apiserver_etcd_subset,<br>
+999_99_apiserver_etcd_proto_random.<br>
+The first four contain the main injection campaign dvided by injection type. 999_99_apiserver_etcd_subset contains the manual campagin of the critical fields, 999_99_apiserver_etcd_proto_random contains the injection to the protobuf protocol.<br>
+The other folders regard error propagation experiments.</p>
+<h1 id="run-experiments">Run experiments</h1>
+<p>In this sections there are instructions to run injections in the communication channel between the Apiserver and Etcd described in section IV and VC1-3 of the paper, with the single control plane node setup .</p>
+<h2 id="setup-environment">Setup environment</h2>
+<p>In this section there are the instructions to setup the experimental environment, described in section VA of the paper.<br>
+The environment is composed by a variable number of virtual machines that run on virtual box.<br>
+Each virtual machine has 2 network interfaces (NIC). One is NATed from host, and there is a forwarding rule towards the standard ssh port. This NIC is used to connect to interned. The other NIC is used to connect all the VMs on an internal network (intnet) created by virtualbox. In this network, all the nodes have IPs 192.168.100.x/24.<br>
+The VM contains the executables for Kuberentes v1.27.4, and part of the files you will need to replicate the paper. If you want to setup Kubernetes in a clean environment, please refer to <a href="https://kubernetes.io/docs/setup/">https://kubernetes.io/docs/setup/</a> (but be aware of the assumptions of the script about network interface names, i.e., enp0s8, and paths of the files ), otherwise:</p>
+<ul>
+<li>Download the .ova file</li>
+<li>Import Virtual Machine file (.ova) into virtual box (In virtual box, file, import appliance, select file)</li>
+<li>Clone the VM as many times is needed. (In virtual box, right click on the VM -&gt; Clone)</li>
+</ul>
+<p>Our setup was composed by 5 VMs: 192.168.100.1 (control plane), 192.168.100.2, 192.168.100.3, 192.168.100.4, 192.168.100.20 (client).<br>
+For each VM, start the VM, configure the forwarding port for ssh, rename the host with unique name, and configure the network. The username and password of the VMs are username: root, password: dsn_ae</p>
+<ul>
+<li>To change the port forwarding and setup a forwarding port unique for VM, right click on the VM, network configuration, advanced, port forwarding, and change the host port.</li>
+<li>To rename the host, run in the VM: <code>hostnamectl set-hostname {nameOfVm}</code> (e.g., <code>hostnamectl set-hostname w01</code>). Our setup had the names: w01, w02, w03 etc, plus one VM called “client”</li>
+<li>To configure the newtork run in the VM: <code>nano /etc/netplan/01-netcfg.yaml</code> or <code>vim /etc/netplan/01-netcfg.yaml</code>. Under enp0s8, addresses: [ address ] is the IP of the VM. Set a unique IP in the subnet.</li>
+<li>Run <code>netplan generate</code></li>
+<li>Run <code>netplan apply</code></li>
+<li>Reboot the VM</li>
+</ul>
+<p>Now you can connect to each VM with <code>ssh -p {ForwardingPortConfigured} root@localhost</code> (e.g., ssh -p 8000 root@localhost)<br>
+The repo is already in the VM. If it is not present, clone the repo under “/root/quis” in the VM that will become the control plane of Kubernetes.<br>
+The control plane VM must have ssh access to other VMs created without requiring any password. A section in the start cluster script has the commands to create and distribute keys, however they should also be checked manually.<br>
+Start cluster to check that everything is ok. To do so:</p>
+<ul>
+<li><code>cd quis/cluster</code></li>
+<li>Run <code>cluster/setup_cluster.sh --nodes "192.168.100.2;192.168.100.20" --monitoring--nodes "192.168.100.2" --monitoring</code>. The first time run the script with attribute <code>--create-key --distribute-keys</code>. Note: prometheus will be scheduled on a node called “client”. If there is no node called “client”, please create it at address 192.168.100.20.</li>
+<li><code>kubectl get pods -A -o wide</code></li>
+<li>The script already contains a series of checks. The script must return 0. Otherwise there could be some network issues among components. The script sends a curl to the service of prometheus. Try to run <code>curl 10.104.215.12:9090</code> and make sure you get an answer, run also the script in <code>cluster/manual_query_test.py</code> and make sure its output is empty  (and not “Not ready”) .</li>
+</ul>
+<h3 id="start-cluster-scripts">Start cluster scripts</h3>
+<p>A set of scripts in the repo automate the start of the cluster in different ways, and are called in each experiment. They are all variants of the cluster vanilla setup, replacing some components depending on the use. The vanilla cluster is started with the start_cluster.sh script, which accepts several parameters (same parameters hold for the other scripts):</p>
+<ul>
+<li>--create-key creates a key through ssh-keygen -t ed25519</li>
+<li>--distribute-keys distributes with ssh-copy-id the key /root/.ssh/id_ed25519.pub to all the nodes specified before continuing.</li>
+<li>–nodes requires the IPs of the worker nodes to join between quotes and separated by semicolon: e.g. --nodes “192.168.100.2;192.168.100.3”. The VM must be able to access to the nodes through keys. If for some reason the keys do not work correctly, please use commands to create or distribute manually.</li>
+<li>--monitoring enables the monitoring with prometheus and increases the logging in the cluster.<br>
+Vim is required by the script</li>
+</ul>
+
+<h2 id="setting-up-knative">Setting up Knative</h2>
+We will install Knative 1.13.2, as it is compatible with the Kubernetes version used in Mutiny. The following lines should be added to the 
+<code>setup_cluster.sh</code> script, immediately after the section that checks for the apiserver.<br>
+
+We will use Kourier 1.13.0 as the network manager, we chose this version to match the major and minor release of our Knative installation.<br>
+For instructions on using other network managers (like Istio), please refer to the <a href="https://knative.dev/docs/install/yaml-install/serving/install-serving-with-yaml/">official Knative documentation</a>.
+
+<pre><code>echo "[Knative] Installing Knative Serving..."
+kubectl apply -f https://github.com/knative/serving/releases/download/knative-v1.13.2/serving-crds.yaml
+kubectl apply -f https://github.com/knative/serving/releases/download/knative-v1.13.2/serving-core.yaml
+#Install Knative Kourier (networking layer)
+kubectl apply -f https://github.com/knative-extensions/net-kourier/releases/download/knative-v1.13.0/kourier.yaml
+#configure Knative Serving to use Kourier
+kubectl patch configmap/config-network \
+  --namespace knative-serving \
+  --type merge \
+  --patch '{"data":{"ingress-class":"kourier.ingress.networking.knative.dev"}}'
+
+echo "[Knative] Waiting for Knative components to be ready"
+sleep 5
+kubectl wait --for=condition=Ready pod --all -n knative-serving --timeout=300s
+
+kubectl wait --for=condition=Ready pod --all -n kourier-system --timeout=300s
+
+echo "[Knative] Knative successfully installed"
+</code></pre>
+
+
+<h2 id="Knative performance tests">Prerequisites for Knative Performance Tests</h2>
+To properly test the FaaS infrastructure, we recommend using the official performance tests available directly from the knative/serving repository as the workload <a href="https://github.com/knative/serving/tree/main/test/performance">Knative/serving</a>.<br>
+
+<h3>InfluxDB Setup</h3>
+
+<p>
+Before setting up InfluxDB, we assume that your Kubernetes cluster already includes a
+<code>pv-volume.yaml</code> manifest that defines a 10 GB PersistentVolume. If you use the makefile provided it should be put in <code>/root/pods/storage/</code>
+An example of this manifest is provided in this repository.
+</p>
+
+<p>
+The <code>Makefile</code> located in the <code>influxDB</code> folder will deploy InfluxDB with
+<code>persistence.storageClass=manual</code>, which is compatible with the persistent volume
+defined in the provided manifest. Additionally, the deployment includes a node affinity rule
+that prefers scheduling the database on the node named <code>w01</code>. This value should be
+modified according to your cluster setup.
+</p>
+
+<p>
+We recommend running the database setup manually the first time using the provided
+<code>Makefile</code>. To initialize InfluxDB:
+</p>
+
+<ol>
+  <li>Run <code>make all</code> to deploy the InfluxDB instance.</li>
+  <li>In a separate terminal, execute <code>make port-forward</code> to expose the InfluxDB service.</li>
+  <li>In another terminal, run <code>make setup</code> to create the organization name and bucket.</li>
+</ol>
+
+<p>
+During the initial setup, InfluxDB will generate and store an authentication token
+and password. These credentials are automatically saved and reused in subsequent
+executions. Even if the setup process is repeated, the first generated credentials will remain
+active and will be used by default.
+</p>
+
+<p>
+It is therefore recommended to perform the first setup manually to ensure that the credentials
+and configuration are properly stored before automating subsequent runs.
+</p>
+
+If you use the provided makefile you can automate the setup of influx by adding this lines to the <code>setup_script.sh</code><br>
+<pre><code>cd put/makefile/folder/here
+
+if [ $? -ne 0 ]; then
+  echo "Errore: Impossibile trovare la cartella del Makefile."
+  exit 1
+fi
+
+echo "--- 2. Eseguo il deploy di InfluxDB (make deploy-influx) ---"
+make deploy-influx
+
+sleep 3
+
+echo ""
+echo "--- 3. Creo il secret 'performance-test-config' ---"
+kubectl create secret generic performance-test-config -n default \
+  --from-literal=influxurl="http://local-influx-influxdb2.influx:80" \
+  --from-literal=influxtoken="influx-token" \     #SUBSTITUTE WITH TOKEN FROM PREVIOUS OUTPUT
+  --from-literal=jobname="lcoal" \
+  --from-literal=buildid="local"
+
+echo ""
+echo "--- ✅ Fatto! Deploy e creazione secret completati. ---"
+</code></pre>
+
+
+<h3>Grafana Setup</h3>
+
+<p>
+Grafana is used to visualize experimental data by creating dashboards and graphs for easier analysis.
+To deploy a Grafana instance, use the manifest provided in the <code>grafana</code> folder.
+You can apply it with the following command:
+</p>
+
+<pre><code>kubectl apply -f grafana.yaml</code></pre>
+
+<p>
+This manifest will create the PersistentVolume, PersistentVolumeClaim,
+and all other required Kubernetes resources needed to correctly run a Grafana instance.
+</p>
+
+<p>
+Once the deployment is complete, you can use the provided <code>Makefile</code> (in the <code>grafana</code> folder)
+to expose the Grafana service by running:
+</p>
+
+<pre><code>make port-forward</code></pre>
+
+<p>
+If you are using the same experimental setup with virtual machines configured in NAT mode,
+you will need to add a port forwarding rule in your VM network settings.
+This rule should forward the same port exposed by the <code>Makefile</code> to allow access
+to the Grafana dashboard from your host machine.
+</p><br>
+
+To use our InfluxDB as a datasource for Grafana
+<ol>
+    <li>Navigate to Grafana UI and log in using the user from the installation</li>
+    <li>Create a new datasource for InfluxDB</li>
+    <li>Select the flux query language</li>
+    <li>Server-URL: http://local-influx-influxdb2.influx:80 (Note: this could be different if your grafana instance is hosted outside the cluster)</li>
+    <li>Organization: Knativetest</li>
+    <li>Bucket: knative-serving</li>
+    <li>Token: <i>put token from previous output</i></li>
+</ol>
+
+<h3>Environment variables</h3>
+
+<p>
+The tests require the following environment variables to be properly configured:
+</p>
+
+<pre><code>KO_DOCKER_REPO = (value set for ko)
+SYSTEM_NAMESPACE = knative-serving
+INFLUX_URL = http://local-influx-influxdb2.influx:80
+INFLUX_TOKEN = (token output from the setup command)
+BUILD_ID = local
+JOB_NAME = local
+</code></pre>
+
+<p>
+Make sure to replace the placeholders with your actual configuration values.
+</p>
+
+
+
+
+
+<h2 id="record-phase">Record phase</h2>
+<p>In order to perform the record phase (described in section IVC of the paper), the kube-apiserver must be modified to log every object before storing it to the database. The steps are:</p>
+<ul>
+<li>Get the kubernetes source code</li>
+<li>Modify the apiserver</li>
+<li>Compile</li>
+<li>Copy the container image component to the control plane VM</li>
+<li>Import the container image in containerd</li>
+<li>Replace the image in the manifest of the apiserver</li>
+</ul>
+<p>The detailed steps to do it are the following:<br>
+On a building machine (e.g., your hosting computer):</p>
+<ul>
+<li><code>git clone https://dessert.unina.it:8088/marcobarlo/mutiny</code></li>
+<li>move to the folder (“mutiny” folder on the building machine)</li>
+<li><code>git checkout loggingapiserver</code></li>
+<li><code>make quick-release-images</code></li>
+<li><code>scp -P 8000 _output/release-images/amd64/kube-apiserver.tar root@localhost:/root/kube-apiserver_log.tar</code><br>
+The logging apiserver branch contains logging lines to log the hexadecimal of the string of bytes, in the same points (described above) where we instrumented the code to hook our injector. For example, the line is <code>klog.Infof("GREPTAG %s", hex.EncodeToString(r.bodyBytes))</code> for the file request.go.</li>
+</ul>
+<p>On the control plane node</p>
+<ul>
+<li><code>ctr -n=k8s.io i import /root/kube-apiserver_log.tar</code></li>
+<li>The output will be like: “unpacking <a href="http://registry.k8s.io/kube-apiserver-amd64:v1.27.10-12_293fe8ec038828-dirty">registry.k8s.io/kube-apiserver-amd64:v1.27.10-12_293fe8ec038828-dirty</a>”. Copy the image name (<a href="http://registry.k8s.io/kube-apiserver-amd64:v1.27.10-12_293fe8ec038828-dirty">registry.k8s.io/kube-apiserver-amd64:v1.27.10-12_293fe8ec038828-dirty</a>) .</li>
+<li><code>vim /etc/kubernetes/manifests/kube-apiserver.yaml</code></li>
+<li>Replace image: … with image: <a href="http://registry.k8s.io/kube-apiserver-amd64:v1.27.10-12_293fe8ec038828-dirty">registry.k8s.io/kube-apiserver-amd64:v1.27.10-12_293fe8ec038828-dirty</a></li>
+<li>Replace - --v=6 with - --v=1 to decrease logging level</li>
+<li>Save and exit</li>
+<li>Wait for about 10 seconds and then check with kubectl get pods -A -o wide if the patched apiserver is running correctly</li>
+</ul>
+<p>With the modified apiserver, every create or update will be logged. In the following the steps to get the packets in hex:</p>
+
+
+<ul>
+	<li>
+	Run the Knative/performance test. You can either run all the performance tests using 
+    <code>./performance-test.sh</code> or execute single benchmarks manually with 
+    <code>envsubst &lt; your-benchmark-job.yaml | ko apply --sbom=none -Bf -</code>.
+	</li>
+	<li>Look for logging file of apiserver: under /var/log/pods/kube-system_kube-apiserver*/kube-apiserver/*.log</li>
+	<li>Copy the file to the building machine: scp -P 8000 root@localhost:/var/log/pods/kube-system_kube-apiserver-w01_f814d20b653710512e7863b4d525db8a/kube-apiserver/0.log .</li>
+	<li>Copy the file under the record/apsierver folder (in the building machine) and rename it as apiserver.log</li>
+	<li>run <code>python3 packet_extraction.py</code> that is in record/apiserver</li>
+	<li>The scripts generates the hexes folder, and in each file of the folder there is the hex file of an object.</li>
+</ul>
+
+
+
+
+
+
+<p>Now we need to create the python protobuf files. If the files are already in the repo (python folder) you can skip these steps. Protoc is required, if not present on the machine, please download it (<code>apt install protobuf</code> on apt distros):</p>
+<ul>
+<li>Move the hexes folder and field_extraction.py into the kubernetes root folder (“mutiny” on the building machine) and move there. Run (with bash shell):</li>
+<li><code>cp -r staging/src/k8s.io .</code></li>
+<li><code>mkdir python</code></li>
+<li><code>protos=$(find . -name "generated.proto" -type f -printf '%P\n')</code></li>
+<li><code>for proto in ${protos[@]}; do echo $proto; protoc -I vendor/ -I third_party/protobuf/ --python_out=python $proto; done</code></li>
+</ul>
+<p>This should create the python protobuf files, used to extract the fields.</p>
+<ul>
+<li>If you don’t have a python environment on the machine, run <code>docker run -it --rm --name python -v .:/home/kubernetes python:3.13-rc-bullseye /bin/bash</code></li>
+<li>In the container run: <code>pip3 install protobuf</code></li>
+<li><code>pip3 install k8s-proto</code><br>
+Now extract the fields from the hexes:</li>
+<li><code>python3 field_extraction.py</code></li>
+<li>The folder decoded should have been created, along with files fields.txt and indexes.txt</li>
+<li>move hexes decoded indexes.txt and fields.txt back to record/apiserver (<code>mv hexes decoded indexes.txt fields.txt ../record/apiserver</code>)</li>
+</ul>
+<h2 id="injection-campaign">Injection campaign</h2>
+<h3 id="collect-baselines">Collect baselines</h3>
+<p>Modify scripts to fit your setup:</p>
+<ul>
+<li><a href="http://msgBaseline.sh">msgBaseline.sh</a> contains the call to setup_cluster.sh with the IPs of the nodes. If different from the script change them to your setup. It also contains hardcoded the IP of the client (192.168.100.20). If it is different please change it.<br>
+Make sure that the script setup_cluster.sh runs correctly with 0 exit code. It will be called for each experiment.<br>
+In scripts/baselines run<br>
+<code>./msgBaseline.sh</code></li>
+</ul>
+<h3 id="prepare-to-inject">Prepare to inject</h3>
+<p>The indexes.txt and fields.txt files will be used to generate a campaign and inject at the same time.<br>
+Copy the files to the control plane  VM</p>
+<ul>
+<li>cd into record/apiserver</li>
+<li><code>scp -P {port} fields.txt indexes.txt root@localhost:/root/quis/scripts/etcdinjection</code>  (port of given VM is 8000)</li>
+</ul>
+<p>Build the apiserver instrumented with injector:</p>
+<ul>
+<li>in the kubernetes root folder: <code>git checkout injectingapiserver</code></li>
+<li><code>make quick-release-images</code><br>
+Note: the command generate the outputs in the _output folder, which is ignored by git. Everytime the branch is changed, make quick-release-images must be executed to have the images of that branch.<br>
+The branch has:</li>
+<li>injector folder into the kubernetes root folder under staging/src/k8s.io/client-go/rest/</li>
+<li>instrumented the files store.go of the apiserver and request.go of client-go to call the injector if started</li>
+<li>instrumented the cmd/kube-apiserver (and all others cmd/*/*.go ) to start the injector in all components</li>
+</ul>
+<p>Copy the image to the control plane VM and run it (a copy of the image is already present on the VM in /root):</p>
+<ul>
+<li><code>scp -P 8000 _output/release-images/amd64/kube-apiserver.tar root@localhost:/root/kube-apiserver_inj.tar</code></li>
+<li>Repeat the steps above to replace the image in /etc/kubernetes/manifests/kube-apiserver.yaml (repeated in the following)
+<ul>
+<li><code>ctr -n=k8s.io i import /root/kube-apiserver_inj.tar</code></li>
+<li>The output will be like: “unpacking <a href="http://registry.k8s.io/kube-apiserver-amd64:v1.27.10-12_293fe8ec038828-dirty">registry.k8s.io/kube-apiserver-amd64:v1.27.10-12_293fe8ec038828-dirty</a>”. Copy the image name (<a href="http://registry.k8s.io/kube-apiserver-amd64:v1.27.10-12_293fe8ec038828-dirty">registry.k8s.io/kube-apiserver-amd64:v1.27.10-12_293fe8ec038828-dirty</a>) .</li>
+<li><code>vim /etc/kubernetes/manifests/kube-apiserver.yaml</code></li>
+<li>Replace image: … with image: <a href="http://registry.k8s.io/kube-apiserver-amd64:v1.27.10-12_293fe8ec038828-dirty">registry.k8s.io/kube-apiserver-amd64:v1.27.10-12_293fe8ec038828-dirty</a></li>
+<li>Replace - --v=1 with - --v=6 to increase again logging level</li>
+<li>Save and exit</li>
+<li>Wait for about 10 seconds and then check with <code>kubectl get pods -A -o wide</code> if the patched apiserver is running correctly</li>
+</ul>
+</li>
+</ul>
+<p>Download necessary tools in the control plane VM (this will also install go):</p>
+<ul>
+<li><code>git clone https://github.com/vmware-tanzu/k-bench.git</code></li>
+<li><code>cd k-bench</code></li>
+<li><code>./install.sh</code><br>
+Donwload necessary tools on client VM:</li>
+<li><code>wget https://github.com/tsenart/vegeta/releases/download/v12.11.1/vegeta_12.11.1_linux_amd64.tar.gz</code></li>
+<li><code>tar -xvf vegeta_12.11.1_linux_amd64.tar.gz</code></li>
+</ul>
+<p>Modify scripts to fit your setup:</p>
+<ul>
+<li>helper_CPinj.sh contains the call to setup_cluster_inj.sh with the IPs of the nodes. If different from the script change them to your setup. It also contains hardcoded the IP of the client (192.168.100.20). If it is different please change it.</li>
+<li>Do the same in other scripts (<a href="http://msgDrop.sh">msgDrop.sh</a>  <a href="http://msgInjCampaign.sh">msgInjCampaign.sh</a>, <a href="http://msgInjCampaignless.sh">msgInjCampaignless.sh</a>): check for the command to restart the cluster to adapt it to your setup.</li>
+</ul>
+<h3 id="inject">Inject</h3>
+<p>The VMs given are limited in terms of disk size (100 GB). It may not be sufficient to host data for the entire paper. If you want to replicate data for the entire paper (it may take a long time, see after), we advice either copying the files and create a VM with bigger size, or (better) mount an external volume (another disk or a network FS) in /root/results (it is how our setup worked).<br>
+Run <code>cd scripts; ./msgInjCampaignless.sh</code><br>
+This script runs injections of type bit flip and agnostic value set (0 for integers, empty for strings)<br>
+Wait for a very long time (in our setup, around 12 days, we advice to modify scripts to take a subset)<br>
+Similarly, run scripts/msgDrop.sh to perform the campaign with injections of type drop, and<br>
+scripts/msgProto.sh to perform the campaign with random injections to protobuf protocol.<br>
+In each script (e.g., helper_CPinj.sh, <a href="http://msgDrop.sh">msgDrop.sh</a>  <a href="http://msgInjCampaign.sh">msgInjCampaign.sh</a>, <a href="http://msgInjCampaignless.sh">msgInjCampaignless.sh</a>, <a href="http://msgProto.sh">msgProto.sh</a>, <a href="http://CPproto.py">CPproto.py</a>) there is a command that automatically setups the cluster with the setup_cluster script family: look for it and adapt it to your setup.<br>
+Each campaign saves data by default to /root/results, in a folder named with the time of the start of the script. Please, change path if needed.<br>
+<a href="http://msgInjCampaign.sh">msgInjCampaign.sh</a> is instead used to perform the value set campaign of the critical fields. The campaign is saved in the campaign.csv file.</p>
+<h1 id="data-analysis">Data analysis</h1>
+<p>In the following, there is the description to perform data analysis of the injections towards Etcd as described in section VC of the paper.</p>
+<h2 id="data-organization">Data organization</h2>
+<p>Under /root/results there should be the folders with all results collected. Each folder has the name following the pattern {day}_{minute}_{hour}.<br>
+In each folder there is a set of subfolder named like [progressive number of injection]_[workload] , e.g., 1_deploy ,1_scale, … , 400_deploy …<br>
+Each of these subfolder is an injection experiment.<br>
+In each folder, there is a file with latencies, a file with the tag of the injection, and all the logs collected.</p>
+<h2 id="analyze-injection-data">Analyze injection data</h2>
+<p>The MutinyScripts contains the script for the anlysis in the folder “analysis”<br>
+Run<br>
+<code>docker run -p 8888:8888 -v ./:/home/jovyan/mutiny jupyter/minimal-notebook</code><br>
+where the -v volume is need to mount results and scripts in the container.<br>
+Replace: ./ with the path that contains the results (/root/results if not copied elsewhere) and the scripts to analyze them.<br>
+/home/jovyan/mutiny is instead the path where you can find the mounted scripts and data inside the container.</p>
+<p>Connect with {host on which the container is executing}:8888 in your browser, e.g. localhost:8888.<br>
+Run the notebook msgInjection_overall.ipynb through the graphic interface</p>
+<h3 id="msginjection_overall.ipynb">msgInjection_overall.ipynb</h3>
+<p>The first cell runs installations needed for the first time you run the container<br>
+The second cell is made of functions that will be used in subsequent blocks.<br>
+The third cell is where the main starts. It analyzes the baseline results. Update the folder path of your baselines accordingly (<code>dirs = [ f.path for f in os.scandir("../../results/"+analyze) if f.is_dir()]</code>).<br>
+The  fourth cell sets the folders to analyze. Change folders’ name accordingly in the list of folders (analyzess=[“999_99_apiserver_etcd_subset”,<br>
+“999_99_99_apiserver_to_etc_ordered_127_allfields”,<br>
+“999_99_apiserver_etcd_proto_random”,<br>
+“999_99_apiserver_to_etcd_ordered_allfields_datavaluesetrandom”,<br>
+“999_99_apiserver_etcd_drop_extended”,<br>
+“999_99_apiserver_etcd_drop”])<br>
+Fifth cell is again some helper functions.<br>
+Sixth cell runs the analysis of the results.<br>
+The following cells take the data built in the sixth cell and elaborate it to create tables and plots.</p>
+<h1 id="propagation">Propagation</h1>
+<p>In the following, there is described how to perform the propagation experiment (and its data analysis) described in section VC4 of the paper.<br>
+Similarly to the apiserver, repeat the recording phase for kube-controller-manager, kube-scheduler, and kubelet. (Replace the images of the pods in the manifest files in /etc/kubernetes/manifests, and run some experiments).<br>
+The logging images are in the loggingapiserver branch and they have been all generated when make quick-release-images was run, while the injecting images are in the injectinapiserver branch. A copy of the images is already in the VM.<br>
+The files with recorded fields are already in the VM as well, in scripts/propagation</p>
+<h3 id="kubelet">kubelet</h3>
+<p>For the kubelet the steps to follow are a little bit different.<br>
+Instead of<br>
+<code>make quick-release-images</code><br>
+The command to compile the modified kubelet is<br>
+<code>make WHAT=cmd/kubelet</code><br>
+This command also requires go installed on the building machine (<code>sudo snap install go --classic</code> if you are on ubuntu), and requires the same glibc version of the target VM (hence, compile on a distro, or in a container with the same version of the target, i.e. ubuntu 20.04).<br>
+The such compiled kubelet is in<br>
+<code>_output/local/go/bin/kubelet</code><br>
+Move it to the worker node 192.168.100.2 (or a different one, based on your setup, but be aware that the ip used in the scripts is this one, it must be changed otherwise) in <code>/usr/local/bin/kubelet_inj</code><br>
+On the 192.168.100.2 node, to replace the kubelet with the logging or injecting one, run<br>
+<code>systemctl stop kubelet</code><br>
+<code>mv /usr/local/bin/kubelet_inj /usr/local/bin/kubelet</code><br>
+<code>systemctl restart kubelet</code><br>
+For the kubelet, the logging can be obtained thorugh<br>
+<code>journalctl -e -u kubelet --no-pager &gt; kubelet.log</code></p>
+<h2 id="run-experiments-1">Run experiments</h2>
+<p>For the injection phase, run the scripts in scripts/propagation (<a href="http://msgPropScheduler.sh">msgPropScheduler.sh</a>, <a href="http://msgPropController.sh">msgPropController.sh</a>, <a href="http://msgPropKubelet.sh">msgPropKubelet.sh</a>). They will base the campaign on the files fields_controller.txt, fields_scheduler.txt, and fields_kubelet.txt.</p>
+<h2 id="analyze-data">Analyze data</h2>
+<p>Copy the results folder into the Kubernetes source tree (loggingapiserver branch, if you are in the injectingapiserver branch please, <code>git checkout loggingapiserver</code> to change branch). Run the scripts: propation_contr.py, propagation_sched.py, propagation_kubelet.py (in “analysis” on the building machine, move them to kubernetes source tree as well, i.e., “mutiny” on the building machine). Change the value of the “analyze” variable setting the folder name of your results.</p>
+</div>
+</body>
+
+</html>
